@@ -1,0 +1,285 @@
+/*
+ * Tên dự án: Hệ thống phân loại sản phẩm theo màu sắc (v2.1 - Chạy liên tục)
+ * Tác giả: Gemini (dựa trên mã nguồn của bạn)
+ * Ngày: 13/11/2025
+ *
+ * --- MÔ TẢ CẬP NHẬT ---
+ * v2.1:
+ * - Thay đổi logic: Băng chuyền LUÔN CHẠY ở trạng thái RUNNING.
+ * - Khi phát hiện màu, servo gạt sản phẩm nhưng băng chuyền KHÔNG DỪNG.
+ * - Hệ thống tự động quay lại tìm màu ngay sau khi gạt xong.
+ * - Nút START/STOP dùng để Bật/Tắt toàn bộ hệ thống.
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // Thư viện cho LCD I2C
+#include <Servo.h>             // Thư viện cho Servo
+
+// --- Cấu hình LCD ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Thử 0x27 hoặc 0x3F
+
+// --- Cấu hình Cảm biến TCS3200 ---
+#define S0 8
+#define S1 9
+#define S2 10
+#define S3 11
+#define sensorOut 12
+int redValue = 0, greenValue = 0, blueValue = 0;
+#define NUM_SAMPLES 5 // Số lần đọc mẫu để chống nhiễu
+
+// --- Cấu hình Động cơ (L298N) ---
+#define motorENA 5 // Chân ENA (PWM - Tốc độ)
+#define motorIN1 4 // Chân IN1
+#define motorIN2 7 // Chân IN2
+#define CONVEYOR_SPEED 60 // Tốc độ băng chuyền (0-255)
+
+// --- Cấu hình Servo (MG995) ---
+#define servoPin 3
+Servo myServo;
+#define ANGLE_NEUTRAL 90 // Vị trí chờ
+#define ANGLE_RED 45     // Vị trí gạt Đỏ
+#define ANGLE_GREEN 135  // Vị trí gạt Xanh Lá
+#define ANGLE_BLUE 180   // Vị trí gạt Xanh Dương
+
+// --- Cấu hình Nút nhấn ---
+#define BUTTON_START_PIN A0 // Nút bắt đầu
+#define BUTTON_STOP_PIN A1  // Nút dừng
+
+// --- NGƯỠNG NHẬN DIỆN MÀU (Cần bạn tự hiệu chỉnh) ---
+// Giá trị pulseIn càng THẤP, màu đó càng MẠNH.
+// Mở Serial Monitor để xem giá trị trung bình R, G, B rồi đặt ngưỡng.
+int threshold = 80;
+
+// --- Trạng thái hệ thống ---
+#define STATE_STOPPED 0
+#define STATE_RUNNING 1
+int systemState = STATE_STOPPED; // Ban đầu, hệ thống ở trạng thái Dừng
+
+// Biến cache cho LCD để chống nháy
+String lcdCacheL1 = "";
+String lcdCacheL2 = "";
+
+void setup() {
+  Serial.begin(9600); // Mở cổng Serial để gỡ lỗi
+
+  // Khởi động màn hình LCD
+  lcd.init();
+  lcd.backlight();
+  updateLcd("HE THONG PHAN LOAI", "Dang khoi dong...");
+
+  // Cài đặt chân Cảm biến màu
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+  pinMode(sensorOut, INPUT);
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW); // Đặt tần số quét 20%
+
+  // Cài đặt chân Động cơ
+  pinMode(motorENA, OUTPUT);
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
+
+  // Cài đặt chân Nút nhấn (dùng điện trở kéo nội vi)
+  pinMode(BUTTON_START_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_STOP_PIN, INPUT_PULLUP);
+
+  // Cài đặt Servo
+  myServo.attach(servoPin);
+  myServo.write(ANGLE_NEUTRAL); // Đưa servo về vị trí chờ
+
+  delay(1000); // Chờ 2 giây để khởi động
+  
+  // Dừng băng chuyền khi mới khởi động
+  runConveyor(false, 0); 
+  updateLcd("HE THONG: DUNG", "Nhan START de chay");
+}
+
+void loop() {
+  // 1. Luôn luôn kiểm tra nút nhấn
+  checkButtons();
+
+  // 2. Chỉ chạy logic phân loại nếu hệ thống đang ở trạng thái RUNNING
+  if (systemState == STATE_RUNNING) {
+    // 2.1. Đọc màu (đã có chống nhiễu)
+    readColors_Averaging();
+
+    // 2.2. Xử lý logic nhận diện và phân loại
+    processColorAndSort();
+
+    // In giá trị lên Serial Monitor (để hiệu chỉnh 'threshold')
+    Serial.print("R: "); Serial.print(redValue);
+    Serial.print(" | G: "); Serial.print(greenValue);
+    Serial.print(" | B: "); Serial.println(blueValue);
+    
+    delay(50); // Chờ 50ms
+  } else {
+    // Nếu hệ thống đang dừng, chỉ chờ, không làm gì cả
+    delay(100);
+  }
+}
+
+/**
+ * @brief Cập nhật LCD (chống nháy)
+ * Chỉ viết lên LCD nếu nội dung mới khác nội dung cũ.
+ * Tự động đệm khoảng trắng để xóa ký tự cũ.
+ */
+void updateLcd(String line1, String line2) {
+  if (line1 != lcdCacheL1) {
+    lcd.setCursor(0, 0);
+    lcd.print(line1);
+    for (int i = line1.length(); i < 16; i++) {
+      lcd.print(" "); // Xóa phần còn lại của dòng
+    }
+    lcdCacheL1 = line1;
+  }
+  if (line2 != lcdCacheL2) {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+    for (int i = line2.length(); i < 16; i++) {
+      lcd.print(" "); // Xóa phần còn lại của dòng
+    }
+    lcdCacheL2 = line2;
+  }
+}
+
+/**
+ * @brief Kiểm tra hai nút nhấn START và STOP.
+ * Xử lý việc thay đổi trạng thái hệ thống.
+ */
+void checkButtons() {
+  // Kiểm tra nút START (đọc LOW vì dùng INPUT_PULLUP)
+  if (digitalRead(BUTTON_START_PIN) == LOW) {
+    delay(50); // Chống dội (debounce)
+    if (digitalRead(BUTTON_START_PIN) == LOW && systemState == STATE_STOPPED) {
+      // Nếu đang dừng, thì chạy
+      systemState = STATE_RUNNING;
+      runConveyor(true, CONVEYOR_SPEED);
+      updateLcd("BANG CHUYEN: CHAY", "Dang doc mau...");
+    }
+  }
+
+  // Kiểm tra nút STOP
+  if (digitalRead(BUTTON_STOP_PIN) == LOW) {
+    delay(50); // Chống dội (debounce)
+    if (digitalRead(BUTTON_STOP_PIN) == LOW && (systemState == STATE_RUNNING)) {
+      // Nếu đang chạy, thì dừng
+      systemState = STATE_STOPPED;
+      runConveyor(false, 0);
+      myServo.write(ANGLE_NEUTRAL); // Đưa servo về 0
+      updateLcd("HE THONG: DUNG", "Nhan START de chay");
+    }
+    // Lưu ý: Nếu đang phân loại (sorting), nút STOP sẽ không ăn
+    // cho đến khi phân loại xong. Đây là thiết kế để tránh kẹt.
+  }
+}
+
+/**
+ * @brief Đọc giá trị 3 màu R, G, B (có lấy trung bình)
+ * Đọc NUM_SAMPLES lần và lấy trung bình để chống nhiễu.
+ */
+void readColors_Averaging() {
+  long redSum = 0, greenSum = 0, blueSum = 0;
+  long timeout = 100000; // 0.1 giây
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    // Đọc màu Đỏ (Red)
+    digitalWrite(S2, LOW); digitalWrite(S3, LOW);
+    redSum += pulseIn(sensorOut, LOW, timeout);
+    delay(5); // Chờ ngắn
+
+    // Đọc màu Xanh Lá (Green)
+    digitalWrite(S2, HIGH); digitalWrite(S3, HIGH);
+    greenSum += pulseIn(sensorOut, LOW, timeout);
+    delay(5);
+
+    // Đọc màu Xanh Dương (Blue)
+    digitalWrite(S2, LOW); digitalWrite(S3, HIGH);
+    blueSum += pulseIn(sensorOut, LOW, timeout);
+    delay(5);
+  }
+
+  // Lấy trung bình
+  redValue = redSum / NUM_SAMPLES;
+  greenValue = greenSum / NUM_SAMPLES;
+  blueValue = blueSum / NUM_SAMPLES;
+}
+
+/**
+ * @brief Điều khiển băng chuyền (chỉ chạy/dừng, không cập nhật LCD)
+ */
+void runConveyor(bool run, int speed) {
+  if (run) {
+    // Chạy thuận
+    digitalWrite(motorIN1, HIGH);
+    digitalWrite(motorIN2, LOW);
+    analogWrite(motorENA, speed);
+  } else {
+    // Dừng (phanh)
+    digitalWrite(motorIN1, LOW);
+    digitalWrite(motorIN2, LOW);
+    analogWrite(motorENA, 0);
+  }
+}
+
+/**
+ * @brief Hàm chính: Kiểm tra màu và điều khiển servo (đã tối ưu LCD).
+ */
+void processColorAndSort() {
+  int detectedColor = 0; // 0=Không, 1=Đỏ, 2=Xanh Lá, 3=Xanh Dương
+
+  // Logic nhận diện (Giá trị càng THẤP, màu càng MẠNH)
+  // Thêm điều kiện > 0 để tránh trường hợp timeout (pulseIn trả về 0)
+
+  // Kiểm tra màu Đỏ
+  if (redValue < greenValue && redValue < blueValue && redValue < threshold && redValue > 0) {
+    detectedColor = 1;
+  }
+  // Kiểm tra màu Xanh Lá
+  else if (greenValue < redValue && greenValue < blueValue && greenValue < threshold && greenValue > 0) {
+    detectedColor = 2;
+  }
+  // Kiểm tra màu Xanh Dương
+  else if (blueValue < redValue && blueValue < greenValue && blueValue < threshold && blueValue > 0) {
+    detectedColor = 3;
+  }
+
+  // Nếu phát hiện được một trong 3 màu
+  if (detectedColor > 0) {
+
+    // 1. THAY ĐỔI: KHÔNG DỪNG BĂNG CHUYỀN
+    // runConveyor(false, 0); // (Đã xóa dòng này)
+
+    // 2. Điều khiển servo gạt và hiển thị LCD (đã rút gọn)
+    if (detectedColor == 1) {
+      updateLcd("P.LOAI: DO", "Dang gat...");
+      myServo.write(ANGLE_RED);
+    } else if (detectedColor == 2) {
+      updateLcd("P.LOAI: X. LA", "Dang gat...");
+      myServo.write(ANGLE_GREEN);
+    } else if (detectedColor == 3) {
+      updateLcd("P.LOAI: X. DUONG", "Dang gat...");
+      myServo.write(ANGLE_BLUE);
+    }
+
+    delay(1500); // Chờ 1.5 giây để servo gạt xong
+                 // Lưu ý: Trong 1.5s này, băng chuyền VẪN CHẠY
+                 // nhưng cảm biến không đọc. Cần đặt sản phẩm
+                 // cách xa nhau để tránh bỏ lỡ.
+
+    // 4. Đưa servo về vị trí chờ (neutral)
+    myServo.write(ANGLE_NEUTRAL);
+    delay(500); // Chờ servo về vị trí
+
+    // 5. THAY ĐỔI: Xóa tất cả logic dừng hệ thống.
+    // Hệ thống sẽ tự động quay lại vòng lặp loop()
+    // và tiếp tục đọc màu ở trạng thái STATE_RUNNING.
+
+  }
+  // Nếu không phát hiện màu gì, thì giữ nguyên trạng thái
+  // và cập nhật LCD (nếu cần)
+  else {
+    updateLcd("BANG CHUYEN: CHAY", "Dang doc mau...");
+  }
+}
