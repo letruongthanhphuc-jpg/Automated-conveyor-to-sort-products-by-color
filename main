@@ -1,8 +1,4 @@
-/*
- * Tên dự án: Hệ thống phân loại sản phẩm theo màu sắc (v2.1 - Chạy liên tục)
- * Tác giả: Gemini (dựa trên mã nguồn của bạn)
- * Ngày: 13/11/2025
- *
+
  * --- MÔ TẢ CẬP NHẬT ---
  * v2.1:
  * - Thay đổi logic: Băng chuyền LUÔN CHẠY ở trạng thái RUNNING.
